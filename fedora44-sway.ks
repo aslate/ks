@@ -186,6 +186,19 @@ if [ -e "$completion_marker" ]; then
     exit 0
 fi
 
+trap 'echo "Credential rotation interrupted; networking remains blocked." >&2; exit 1' \
+    HUP INT TERM
+
+if [ ! -t 0 ] || [ ! -t 1 ]; then
+    echo "ERROR: Credential rotation requires an interactive terminal." >&2
+    exit 1
+fi
+
+# Use the controlling terminal explicitly so PAM and cryptsetup cannot inherit
+# a pipe or the systemd journal as their input.
+exec </dev/tty >/dev/tty 2>&1
+/usr/bin/stty sane
+
 echo "======================================================="
 echo " First boot: secure the installation credentials"
 echo " Networking and graphical login are currently blocked."
@@ -195,6 +208,7 @@ echo
 echo "Set the password for user aslate."
 until /usr/bin/passwd aslate; do
     echo "Password update failed; please try again."
+    /usr/bin/sleep 1
 done
 
 root_source=$(/usr/bin/findmnt -nro SOURCE /)
@@ -211,6 +225,7 @@ echo
 echo "Change the temporary LUKS passphrase for $luks_device."
 until /usr/bin/cryptsetup luksChangeKey "$luks_device"; do
     echo "LUKS passphrase update failed; please try again."
+    /usr/bin/sleep 1
 done
 
 /usr/bin/touch "$completion_marker"
@@ -227,13 +242,17 @@ cat << 'EOF' > /etc/systemd/system/firstboot-credential-rotation.service
 [Unit]
 Description=Rotate installation credentials before networking and login
 ConditionPathExists=!/var/lib/firstboot-setup/credentials-rotated
-After=local-fs.target
-Before=NetworkManager.service greetd.service getty@tty1.service
-Conflicts=getty@tty1.service
+Wants=network-pre.target
+After=local-fs.target plymouth-start.service
+Before=network-pre.target network.target greetd.service getty@tty1.service
 
 [Service]
 Type=oneshot
+ExecStartPre=-/usr/bin/plymouth quit
 ExecStart=/usr/local/sbin/firstboot-credential-rotation
+ExecStartPost=/usr/bin/test -e /var/lib/firstboot-setup/credentials-rotated
+# Take tty1 from the boot splash and make it the controlling terminal. passwd
+# and cryptsetup both require a real controlling terminal.
 StandardInput=tty-force
 StandardOutput=tty
 StandardError=tty
@@ -247,25 +266,14 @@ EOF
 chmod 0644 /etc/systemd/system/firstboot-credential-rotation.service
 chown root:root /etc/systemd/system/firstboot-credential-rotation.service
 
-install -d -m 0755 \
-    /etc/systemd/system/NetworkManager.service.d \
-    /etc/systemd/system/greetd.service.d
-cat << 'EOF' > /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
-[Unit]
-Requires=firstboot-credential-rotation.service
-After=firstboot-credential-rotation.service
-EOF
+install -d -m 0755 /etc/systemd/system/greetd.service.d
 cat << 'EOF' > /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
 [Unit]
 Requires=firstboot-credential-rotation.service
 After=firstboot-credential-rotation.service
 EOF
-chmod 0644 \
-    /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf \
-    /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
-chown root:root \
-    /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf \
-    /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
+chmod 0644 /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
+chown root:root /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
 
 # Install the pinned Codex CLI as aslate after networking is permitted. A timer
 # avoids blocking boot and retries on later boots until installation succeeds.
