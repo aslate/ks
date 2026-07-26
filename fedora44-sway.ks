@@ -76,8 +76,8 @@ btrfs /var --subvol --name=@var fedora
 btrfs /tmp --subvol --name=@tmp fedora
 btrfs /.snapshots --subvol --name=@snapshots fedora
 
-# Bootloader settings: Disable IPv6, disable crashkernel (kdump), quiet loglevel, disable kernel debug/trace/debugfs
-bootloader --append="ipv6.disable=1 crashkernel=no quiet loglevel=0 debug=0 debugfs=off systemd.coredump=0 kernel.ftrace_enabled=0 rd.systemd.debug_shell=0 ptrace_scope=2"
+# Limit kernel command-line hardening to settings that apply during early boot.
+bootloader --append="ipv6.disable=1 crashkernel=no quiet loglevel=3 rd.systemd.debug_shell=0"
 
 # System services
 services --enabled=NetworkManager,firewalld,systemd-resolved,greetd --disabled=avahi-daemon,avahi-daemon.socket,kdump,abrtd,abrt-ccpp,abrt-oops,brltty,brltty-udev,sys-kernel-debug.mount,sys-kernel-tracing.mount
@@ -542,11 +542,11 @@ install intel_spi_pci /bin/false
 install intel_spi_platform /bin/false
 MODPROBE
 
-# Mask and disable kdump, systemd-coredump, ABRT services, and kernel feature mounts
+# Use systemd masks to disable services and debug, tracing, and configfs mounts.
 systemctl mask kdump.service abrt-ccpp.service abrt-oops.service abrtd.service systemd-coredump.service systemd-coredump.socket systemd-debug-shell.service sys-kernel-debug.mount sys-kernel-tracing.mount sys-kernel-config.mount 2>/dev/null || true
 systemctl disable kdump.service abrt-ccpp.service abrt-oops.service abrtd.service systemd-coredump.service systemd-coredump.socket sys-kernel-debug.mount sys-kernel-tracing.mount 2>/dev/null || true
 
-# Disable systemd coredump storage completely
+# Disable core dumps through native systemd configuration and process limits.
 mkdir -p /etc/systemd/coredump.conf.d
 cat << 'EOF' > /etc/systemd/coredump.conf.d/disable-coredump.conf
 [Coredump]
@@ -555,7 +555,6 @@ ProcessSizeMax=0
 ExternalSizeMax=0
 EOF
 
-# Set core dump process limits to zero globally
 mkdir -p /etc/security/limits.d
 cat << 'EOF' > /etc/security/limits.d/10-disable-coredumps.conf
 * hard core 0
@@ -574,8 +573,8 @@ net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 
-# Disable kernel sysrq, core dumps, ftrace, ptrace, and restrict dmesg in sysctl
-cat << 'EOF' > /etc/sysctl.d/99-disable-debug-coredump.conf
+# Apply runtime kernel restrictions through sysctl.
+cat << 'EOF' > /etc/sysctl.d/99-kernel-hardening.conf
 kernel.sysrq = 0
 kernel.core_pattern = /dev/null
 fs.suid_dumpable = 0
@@ -653,4 +652,9 @@ chown root:root \
     /etc/firewalld/zones/drop.xml \
     /etc/firewalld/zones/public.xml
 firewall-offline-cmd --check-config
+
+/usr/lib/systemd/systemd-sysctl --cat-config >/dev/null
+test -f /etc/sysctl.d/99-kernel-hardening.conf
+test -f /etc/systemd/coredump.conf.d/disable-coredump.conf
+test -f /etc/security/limits.d/10-disable-coredumps.conf
 %end
