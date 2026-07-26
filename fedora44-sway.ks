@@ -228,7 +228,7 @@ cat << 'EOF' > /etc/systemd/system/firstboot-credential-rotation.service
 Description=Rotate installation credentials before networking and login
 ConditionPathExists=!/var/lib/firstboot-setup/credentials-rotated
 After=local-fs.target
-Before=NetworkManager.service greetd.service
+Before=NetworkManager.service greetd.service getty@tty1.service
 Conflicts=getty@tty1.service
 
 [Service]
