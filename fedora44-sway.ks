@@ -152,41 +152,194 @@ nano
 %post --erroronfail --log=/root/kickstart-post.log
 set -Eeuo pipefail
 
-# Install the Codex CLI when the npm registry is reachable. Keep the helper
-# available so installation can be retried safely after first boot.
-cat << 'EOF' > /usr/local/sbin/install-codex-cli
+# Ensure the standard user owns the home directory before creating user files.
+chown -R aslate:aslate /home/aslate
+
+# Require offline rotation of the installation credentials before networking or
+# the graphical login can start on the first installed boot.
+install -d -m 0755 /usr/local/sbin /var/lib/firstboot-setup
+cat << 'EOF' > /usr/local/sbin/firstboot-credential-rotation
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+completion_marker=/var/lib/firstboot-setup/credentials-rotated
+if [ -e "$completion_marker" ]; then
+    exit 0
+fi
+
+echo "======================================================="
+echo " First boot: secure the installation credentials"
+echo " Networking and graphical login are currently blocked."
+echo "======================================================="
+echo
+
+echo "Set the password for user aslate."
+until /usr/bin/passwd aslate; do
+    echo "Password update failed; please try again."
+done
+
+root_source=$(/usr/bin/findmnt -nro SOURCE /)
+root_mapper=$(printf '%s\n' "$root_source" | /usr/bin/sed 's/\[.*$//')
+luks_device=$(/usr/bin/cryptsetup status "$root_mapper" |
+    /usr/bin/awk '$1 == "device:" { print $2; exit }')
+
+if [ -z "$luks_device" ] || ! /usr/bin/cryptsetup isLuks "$luks_device"; then
+    echo "ERROR: Unable to resolve the LUKS device backing /." >&2
+    exit 1
+fi
+
+echo
+echo "Change the temporary LUKS passphrase for $luks_device."
+until /usr/bin/cryptsetup luksChangeKey "$luks_device"; do
+    echo "LUKS passphrase update failed; please try again."
+done
+
+/usr/bin/touch "$completion_marker"
+/usr/bin/chmod 0600 "$completion_marker"
+/usr/bin/rm -f /root/anaconda-ks.cfg /root/original-ks.cfg
+
+echo
+echo "Credential rotation completed. Networking and greetd may now start."
+EOF
+chmod 0700 /usr/local/sbin/firstboot-credential-rotation
+chown root:root /usr/local/sbin/firstboot-credential-rotation
+
+cat << 'EOF' > /etc/systemd/system/firstboot-credential-rotation.service
+[Unit]
+Description=Rotate installation credentials before networking and login
+ConditionPathExists=!/var/lib/firstboot-setup/credentials-rotated
+After=local-fs.target
+Before=NetworkManager.service greetd.service
+Conflicts=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/firstboot-credential-rotation
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+chmod 0644 /etc/systemd/system/firstboot-credential-rotation.service
+chown root:root /etc/systemd/system/firstboot-credential-rotation.service
+
+install -d -m 0755 \
+    /etc/systemd/system/NetworkManager.service.d \
+    /etc/systemd/system/greetd.service.d
+cat << 'EOF' > /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+[Unit]
+Requires=firstboot-credential-rotation.service
+After=firstboot-credential-rotation.service
+EOF
+cat << 'EOF' > /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
+[Unit]
+Requires=firstboot-credential-rotation.service
+After=firstboot-credential-rotation.service
+EOF
+chmod 0644 \
+    /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf \
+    /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
+chown root:root \
+    /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf \
+    /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
+
+# Install the pinned Codex CLI as aslate after networking is permitted. A timer
+# avoids blocking boot and retries on later boots until installation succeeds.
+install -d -o aslate -g aslate -m 0700 \
+    /home/aslate/.cache/npm \
+    /home/aslate/.local/bin \
+    /home/aslate/.local/libexec \
+    /home/aslate/.local/state
+cat << 'EOF' > /home/aslate/.local/libexec/install-codex-cli
 #!/usr/bin/env bash
 set -uo pipefail
 
+readonly codex_version=0.145.0
+readonly codex_bin=/home/aslate/.local/bin/codex
+readonly completion_marker=/home/aslate/.local/state/codex-0.145.0-installed
+
+if [ -x "$codex_bin" ] &&
+    [ "$("$codex_bin" --version 2>/dev/null | /usr/bin/awk '{print $NF}')" = "$codex_version" ]; then
+    /usr/bin/touch "$completion_marker"
+    exit 0
+fi
+
 for attempt in 1 2 3; do
-    echo "Installing Codex CLI (attempt ${attempt} of 3)..."
-    if timeout 300 npm install --global --prefix /usr/local \
-        --no-audit --no-fund @openai/codex@latest; then
-        if [ -x /usr/local/bin/codex ]; then
-            /usr/local/bin/codex --version
+    echo "Installing Codex CLI ${codex_version} as aslate (attempt ${attempt} of 3)..."
+    if /usr/bin/timeout 300 /usr/bin/npm install --global \
+        --prefix /home/aslate/.local --no-fund "@openai/codex@${codex_version}"; then
+        if [ -x "$codex_bin" ] &&
+            [ "$("$codex_bin" --version 2>/dev/null | /usr/bin/awk '{print $NF}')" = "$codex_version" ]; then
+            /usr/bin/touch "$completion_marker"
             exit 0
         fi
-        echo "npm completed but /usr/local/bin/codex was not created." >&2
+        echo "npm completed but the expected Codex version was not installed." >&2
     else
         echo "Codex CLI installation attempt ${attempt} failed." >&2
     fi
 
-    if [ "${attempt}" -lt 3 ]; then
-        sleep 5
+    if [ "$attempt" -lt 3 ]; then
+        /usr/bin/sleep 5
     fi
 done
 
-echo "Codex CLI was not installed. Retry with: sudo /usr/local/sbin/install-codex-cli" >&2
+echo "Codex CLI was not installed; the timer will retry on the next boot." >&2
 exit 1
 EOF
-chmod 755 /usr/local/sbin/install-codex-cli
+chmod 0700 /home/aslate/.local/libexec/install-codex-cli
+chown -R aslate:aslate /home/aslate/.cache /home/aslate/.local
 
-if ! /usr/local/sbin/install-codex-cli; then
-    echo "WARNING: Continuing without Codex CLI; its Fedora dependencies are installed." >&2
-fi
+cat << 'EOF' > /etc/systemd/system/codex-user-install.service
+[Unit]
+Description=Install pinned Codex CLI for aslate
+Requires=firstboot-credential-rotation.service
+After=firstboot-credential-rotation.service network-online.target
+Wants=network-online.target
+ConditionPathExists=!/home/aslate/.local/state/codex-0.145.0-installed
 
-# Ensure standard user owns home directory
-chown -R aslate:aslate /home/aslate
+[Service]
+Type=oneshot
+User=aslate
+Group=aslate
+Environment=HOME=/home/aslate
+Environment=NPM_CONFIG_CACHE=/home/aslate/.cache/npm
+ExecStart=/home/aslate/.local/libexec/install-codex-cli
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/aslate/.cache/npm /home/aslate/.local
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+ProtectKernelTunables=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+EOF
+
+cat << 'EOF' > /etc/systemd/system/codex-user-install.timer
+[Unit]
+Description=Attempt pinned Codex CLI installation after boot
+
+[Timer]
+OnBootSec=60
+Unit=codex-user-install.service
+
+[Install]
+WantedBy=timers.target
+EOF
+chmod 0644 \
+    /etc/systemd/system/codex-user-install.service \
+    /etc/systemd/system/codex-user-install.timer
+chown root:root \
+    /etc/systemd/system/codex-user-install.service \
+    /etc/systemd/system/codex-user-install.timer
 
 # Configure UK/GB locale and keyboard layout system-wide
 cat << 'EOF' > /etc/locale.conf
@@ -207,21 +360,32 @@ input * {
 }
 EOF
 
-# Configure Graphical boot & Greetd display manager to boot into Sway UI automatically
+# Make the user's local npm binaries available to Sway and all descendants.
+install -d -m 0755 /usr/local/libexec
+cat << 'EOF' > /usr/local/libexec/start-sway
+#!/bin/sh
+PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin"
+export PATH
+exec /usr/bin/sway
+EOF
+chmod 0755 /usr/local/libexec/start-sway
+chown root:root /usr/local/libexec/start-sway
+
+# Configure graphical boot and require an authenticated greetd login into Sway.
 systemctl set-default graphical.target
 
-mkdir -p /etc/greetd
+install -d -m 0755 /etc/greetd
 cat << 'EOF' > /etc/greetd/config.toml
 [default_session]
-command = "tuigreet --time --remember --cmd sway"
+command = "tuigreet --time --cmd /usr/local/libexec/start-sway"
 user = "greeter"
-
-[initial_session]
-command = "sway"
-user = "aslate"
 EOF
+chmod 0644 /etc/greetd/config.toml
+chown root:root /etc/greetd/config.toml
 
-systemctl enable greetd.service 2>/dev/null || true
+systemctl enable firstboot-credential-rotation.service
+systemctl enable codex-user-install.timer
+systemctl enable greetd.service
 
 # Pre-create Sway configuration directory for user aslate
 mkdir -p /home/aslate/.config/sway
@@ -334,13 +498,16 @@ LLMNR=no
 EOF
 
 # Enable systemd-resolved and link stub resolver to /etc/resolv.conf
-systemctl enable systemd-resolved || true
+systemctl enable systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 # Lockdown Firewalld: Set default zone to 'drop' with zero exposed services or ports
 mkdir -p /etc/firewalld/zones
 if [ -f /etc/firewalld/firewalld.conf ]; then
     sed -i 's/^DefaultZone=.*/DefaultZone=drop/' /etc/firewalld/firewalld.conf
+    if ! grep -q '^DefaultZone=drop$' /etc/firewalld/firewalld.conf; then
+        printf '%s\n' 'DefaultZone=drop' >> /etc/firewalld/firewalld.conf
+    fi
 else
     cat << 'EOF' > /etc/firewalld/firewalld.conf
 DefaultZone=drop
@@ -364,4 +531,14 @@ cat << 'EOF' > /etc/firewalld/zones/public.xml
   <description>Strict lockdown zone. All incoming traffic is dropped silently with zero exposed services or ports.</description>
 </zone>
 EOF
+
+chmod 0644 \
+    /etc/firewalld/firewalld.conf \
+    /etc/firewalld/zones/drop.xml \
+    /etc/firewalld/zones/public.xml
+chown root:root \
+    /etc/firewalld/firewalld.conf \
+    /etc/firewalld/zones/drop.xml \
+    /etc/firewalld/zones/public.xml
+firewall-offline-cmd --check-config
 %end
