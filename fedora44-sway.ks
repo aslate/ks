@@ -457,6 +457,23 @@ chmod +x /etc/profile.d/disable-accessibility.sh
 systemctl mask avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
 systemctl disable avahi-daemon.service avahi-daemon.socket 2>/dev/null || true
 
+# Disable Precision Time Protocol synchronization without disabling Ethernet.
+systemctl mask ptp4l.service ptp4l@.service phc2sys.service phc2sys@.service timemaster.service 2>/dev/null || true
+cat > /etc/udev/rules.d/99-z-disable-ptp.rules <<'UDEV'
+# Keep the Ethernet interface, but deny access to its PTP hardware clock and
+# prevent systemd from generating a .device unit for it.
+SUBSYSTEM=="ptp", MODE="0000", TAG-="systemd"
+UDEV
+
+# Disable binfmt_misc activation and prevent the Intel SPI flash devices from appearing.
+systemctl mask proc-sys-fs-binfmt_misc.automount systemd-binfmt.service 2>/dev/null || true
+cat > /etc/modprobe.d/disable-intel-spi.conf <<'MODPROBE'
+blacklist intel_spi_pci
+blacklist intel_spi_platform
+install intel_spi_pci /bin/false
+install intel_spi_platform /bin/false
+MODPROBE
+
 # Mask and disable kdump, systemd-coredump, ABRT services, and kernel feature mounts
 systemctl mask kdump.service abrt-ccpp.service abrt-oops.service abrtd.service systemd-coredump.service systemd-coredump.socket systemd-debug-shell.service sys-kernel-debug.mount sys-kernel-tracing.mount sys-kernel-config.mount 2>/dev/null || true
 systemctl disable kdump.service abrt-ccpp.service abrt-oops.service abrtd.service systemd-coredump.service systemd-coredump.socket sys-kernel-debug.mount sys-kernel-tracing.mount 2>/dev/null || true
