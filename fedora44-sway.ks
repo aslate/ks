@@ -614,17 +614,17 @@ ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
 
 # Lockdown Firewalld: Set default zone to 'drop' with zero exposed services or ports
 mkdir -p /etc/firewalld/zones
-if [ -f /etc/firewalld/firewalld.conf ]; then
-    sed -i 's/^DefaultZone=.*/DefaultZone=drop/' /etc/firewalld/firewalld.conf
-    if ! grep -q '^DefaultZone=drop$' /etc/firewalld/firewalld.conf; then
-        printf '%s\n' 'DefaultZone=drop' >> /etc/firewalld/firewalld.conf
-    fi
+if [[ ! -f /etc/firewalld/firewalld.conf ]]; then
+    echo "ERROR: Packaged /etc/firewalld/firewalld.conf is missing." >&2
+    exit 1
+fi
+
+if grep -q '^DefaultZone=' /etc/firewalld/firewalld.conf; then
+    sed -i 's/^DefaultZone=.*/DefaultZone=drop/' \
+        /etc/firewalld/firewalld.conf
 else
-    cat << 'EOF' > /etc/firewalld/firewalld.conf
-DefaultZone=drop
-CleanupOnExit=yes
-Lockdown=no
-EOF
+    printf '%s\n' 'DefaultZone=drop' \
+        >> /etc/firewalld/firewalld.conf
 fi
 
 cat << 'EOF' > /etc/firewalld/zones/drop.xml
@@ -652,6 +652,31 @@ chown root:root \
     /etc/firewalld/zones/drop.xml \
     /etc/firewalld/zones/public.xml
 firewall-offline-cmd --check-config
+
+systemd-sysusers
+
+getent passwd greeter >/dev/null
+test -x /usr/local/libexec/start-sway
+command -v greetd >/dev/null
+command -v tuigreet >/dev/null
+command -v sway >/dev/null
+
+grep -q '^\[terminal\]$' /etc/greetd/config.toml
+grep -q '^vt = 1$' /etc/greetd/config.toml
+
+systemctl is-enabled greetd.service >/dev/null
+
+greetd_unit=$(systemctl show \
+    --property=FragmentPath \
+    --value \
+    greetd.service)
+
+if [[ -z "$greetd_unit" || ! -f "$greetd_unit" ]]; then
+    echo "ERROR: Unable to locate greetd.service unit file." >&2
+    exit 1
+fi
+
+systemd-analyze verify "$greetd_unit"
 
 /usr/lib/systemd/systemd-sysctl --cat-config >/dev/null
 test -f /etc/sysctl.d/99-kernel-hardening.conf
