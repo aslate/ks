@@ -439,7 +439,6 @@ EOF
 
 cat << 'EOF' > /etc/vconsole.conf
 KEYMAP=gb
-FONT=latarcyrheb-sun16
 EOF
 
 # Global Sway input configuration for UK keyboard layout
