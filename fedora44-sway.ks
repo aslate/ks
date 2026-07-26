@@ -184,10 +184,16 @@ set -euo pipefail
 
 readonly marker=/var/lib/firstboot-credential-rotation.complete
 readonly old_user=changeme
+readonly state_dir=/var/lib/firstboot-credential-rotation
+readonly new_user_file="$state_dir/new-username"
+readonly luks_marker="$state_dir/luks.complete"
+readonly account_marker="$state_dir/account-rename.complete"
 
 if [[ -e "$marker" ]]; then
     exit 0
 fi
+
+install -d -o root -g root -m 0700 "$state_dir"
 
 clear
 printf '%s\n' \
@@ -195,54 +201,98 @@ printf '%s\n' \
     "Networking will remain disabled until this completes." \
     ""
 
-while :; do
-    read -r -p "New username: " new_user
+if [[ -e "$new_user_file" ]]; then
+    IFS= read -r new_user < "$new_user_file"
 
-    if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
-        break
+    if [[ ! "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        echo "Persisted username is invalid; refusing to continue." >&2
+        exit 1
     fi
+else
+    while :; do
+        read -r -p "New username: " new_user
 
-    echo "Enter a valid lowercase Linux username."
-done
+        if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            break
+        fi
 
-if [[ "$new_user" != "$old_user" ]]; then
-    if ! id "$old_user" >/dev/null 2>&1; then
-        echo "Expected initial user '$old_user' does not exist." >&2
+        echo "Enter a valid lowercase Linux username."
+    done
+
+    tmp=$(mktemp "$state_dir/.new-username.XXXXXX")
+    trap '[[ -z "${tmp:-}" ]] || rm -f "$tmp"' EXIT
+    printf '%s\n' "$new_user" > "$tmp"
+    chmod 0600 "$tmp"
+    chown root:root "$tmp"
+    mv "$tmp" "$new_user_file"
+    tmp=
+    sync
+fi
+
+if [[ ! -e "$luks_marker" ]]; then
+    root_source=$(findmnt -nro SOURCE /)
+    root_mapper=$(printf '%s\n' "$root_source" | sed 's/\[.*$//')
+    luks_device=$(cryptsetup status "$root_mapper" |
+        awk '$1 == "device:" { print $2; exit }')
+
+    if [[ -z "$luks_device" ]] || ! cryptsetup isLuks "$luks_device"; then
+        echo "Unable to resolve the LUKS device backing /." >&2
         exit 1
     fi
 
-    if id "$new_user" >/dev/null 2>&1; then
-        echo "User '$new_user' already exists." >&2
+    printf '\nChange the temporary LUKS passphrase for %s.\n' "$luks_device"
+    cryptsetup luksChangeKey "$luks_device"
+
+    touch "$luks_marker"
+    chmod 0600 "$luks_marker"
+    sync
+fi
+
+if [[ ! -e "$account_marker" ]]; then
+    if [[ "$new_user" == "$old_user" ]]; then
+        if ! id "$old_user" >/dev/null 2>&1; then
+            echo "Expected initial user '$old_user' does not exist." >&2
+            exit 1
+        fi
+    elif id "$old_user" >/dev/null 2>&1; then
+        if id "$new_user" >/dev/null 2>&1; then
+            echo "Both '$old_user' and '$new_user' exist; refusing to rename." >&2
+            exit 1
+        fi
+
+        if getent group "$old_user" >/dev/null &&
+            getent group "$new_user" >/dev/null; then
+            echo "Both '$old_user' and '$new_user' groups exist; refusing to rename." >&2
+            exit 1
+        fi
+
+        usermod \
+            --login "$new_user" \
+            --home "/home/$new_user" \
+            --move-home \
+            "$old_user"
+    elif ! id "$new_user" >/dev/null 2>&1; then
+        echo "Neither '$old_user' nor '$new_user' exists." >&2
         exit 1
     fi
 
-    usermod \
-        --login "$new_user" \
-        --home "/home/$new_user" \
-        --move-home \
-        "$old_user"
+    if [[ "$new_user" != "$old_user" ]] &&
+        getent group "$old_user" >/dev/null; then
+        if getent group "$new_user" >/dev/null; then
+            echo "Both '$old_user' and '$new_user' groups exist; refusing to rename." >&2
+            exit 1
+        fi
 
-    if getent group "$old_user" >/dev/null; then
         groupmod --new-name "$new_user" "$old_user"
     fi
+
+    touch "$account_marker"
+    chmod 0600 "$account_marker"
+    sync
 fi
 
 passwd "$new_user"
 
-root_source=$(findmnt -nro SOURCE /)
-root_mapper=$(printf '%s\n' "$root_source" | sed 's/\[.*$//')
-luks_device=$(cryptsetup status "$root_mapper" |
-    awk '$1 == "device:" { print $2; exit }')
-
-if [[ -z "$luks_device" ]] || ! cryptsetup isLuks "$luks_device"; then
-    echo "Unable to resolve the LUKS device backing /." >&2
-    exit 1
-fi
-
-printf '\nChange the temporary LUKS passphrase for %s.\n' "$luks_device"
-cryptsetup luksChangeKey "$luks_device"
-
-install -d -m 0700 /var/lib
 touch "$marker"
 chmod 0600 "$marker"
 
@@ -267,11 +317,11 @@ readonly unit=firstboot-credential-rotation.service
 
 systemctl disable "$unit"
 
-rm -f \
-    "/etc/systemd/system/$unit" \
-    /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
+rm -f /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
 
 systemctl daemon-reload
+
+/usr/bin/chvt 1 || true
 EOF
 chmod 0700 /usr/local/sbin/cleanup-firstboot-credential-rotation
 chown root:root /usr/local/sbin/cleanup-firstboot-credential-rotation
@@ -285,13 +335,13 @@ After=local-fs.target systemd-remount-fs.service
 Wants=local-fs.target
 
 Before=network-pre.target network.target
-Before=NetworkManager.service systemd-networkd.service
-Before=systemd-networkd-wait-online.service NetworkManager-wait-online.service
+Before=NetworkManager.service NetworkManager-wait-online.service
 
 Conflicts=getty@tty2.service
 
 [Service]
 Type=oneshot
+ExecStartPre=/usr/bin/chvt 2
 ExecStart=/usr/local/sbin/firstboot-credential-rotation
 ExecStartPost=/usr/local/sbin/cleanup-firstboot-credential-rotation
 
@@ -319,6 +369,12 @@ After=firstboot-credential-rotation.service
 EOF
 chmod 0644 /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
 chown root:root /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
+
+test -x /usr/bin/chvt
+systemd-analyze verify \
+    /etc/systemd/system/firstboot-credential-rotation.service \
+    /usr/lib/systemd/system/NetworkManager.service \
+    /usr/lib/systemd/system/greetd.service
 
 # Install Codex for the renamed user on the first graphical login with network access.
 install -d -o changeme -g changeme -m 0700 \
