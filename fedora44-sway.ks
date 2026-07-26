@@ -93,10 +93,10 @@ swaylock
 swayidle
 waybar
 mako
-rofi-wayland
+rofi
 brightnessctl
 greetd
-greetd-tuigreet
+tuigreet
 
 # Screenshots & Clipboard Utilities
 grim
