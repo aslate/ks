@@ -113,6 +113,7 @@ wireplumber
 bash-completion
 ca-certificates
 cryptsetup
+curl
 git
 gparted
 nodejs24-bin
@@ -266,6 +267,15 @@ EOF
 chmod 0644 /etc/systemd/system/firstboot-credential-rotation.service
 chown root:root /etc/systemd/system/firstboot-credential-rotation.service
 
+install -d -m 0755 /etc/systemd/system/NetworkManager.service.d
+cat << 'EOF' > /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+[Unit]
+Requires=firstboot-credential-rotation.service
+After=firstboot-credential-rotation.service
+EOF
+chmod 0644 /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+chown root:root /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+
 install -d -m 0755 /etc/systemd/system/greetd.service.d
 cat << 'EOF' > /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
 [Unit]
@@ -275,98 +285,60 @@ EOF
 chmod 0644 /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
 chown root:root /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
 
-# Install the pinned Codex CLI as aslate after networking is permitted. A timer
-# avoids blocking boot and retries on later boots until installation succeeds.
+# Install Codex for aslate on the first graphical login with network access.
 install -d -o aslate -g aslate -m 0700 \
-    /home/aslate/.cache/npm \
     /home/aslate/.local/bin \
     /home/aslate/.local/libexec \
     /home/aslate/.local/state
 cat << 'EOF' > /home/aslate/.local/libexec/install-codex-cli
 #!/usr/bin/env bash
-set -uo pipefail
+set -Eeuo pipefail
 
-readonly codex_version=0.145.0
-readonly codex_bin=/home/aslate/.local/bin/codex
-readonly completion_marker=/home/aslate/.local/state/codex-0.145.0-installed
+readonly installer_url=https://chatgpt.com/codex/install.sh
+readonly lock_file="$HOME/.local/state/codex-install.lock"
 
-if [ -x "$codex_bin" ] &&
-    [ "$("$codex_bin" --version 2>/dev/null | /usr/bin/awk '{print $NF}')" = "$codex_version" ]; then
-    /usr/bin/touch "$completion_marker"
+if command -v codex >/dev/null 2>&1; then
     exit 0
 fi
 
-for attempt in 1 2 3; do
-    echo "Installing Codex CLI ${codex_version} as aslate (attempt ${attempt} of 3)..."
-    if /usr/bin/timeout 300 /usr/bin/npm install --global \
-        --prefix /home/aslate/.local --no-fund "@openai/codex@${codex_version}"; then
-        if [ -x "$codex_bin" ] &&
-            [ "$("$codex_bin" --version 2>/dev/null | /usr/bin/awk '{print $NF}')" = "$codex_version" ]; then
-            /usr/bin/touch "$completion_marker"
-            exit 0
-        fi
-        echo "npm completed but the expected Codex version was not installed." >&2
-    else
-        echo "Codex CLI installation attempt ${attempt} failed." >&2
-    fi
+exec 9>"$lock_file"
+if ! /usr/bin/flock -n 9; then
+    exit 0
+fi
 
-    if [ "$attempt" -lt 3 ]; then
-        /usr/bin/sleep 5
-    fi
-done
+# Another login may have completed the installation while this process waited.
+if command -v codex >/dev/null 2>&1; then
+    exit 0
+fi
 
-echo "Codex CLI was not installed; the timer will retry on the next boot." >&2
-exit 1
+installer=$(/usr/bin/mktemp --tmpdir codex-install.XXXXXX)
+trap '/usr/bin/rm -f "$installer"' EXIT
+
+echo "Downloading the Codex CLI installer..."
+/usr/bin/curl \
+    --fail \
+    --silent \
+    --show-error \
+    --location \
+    --retry 5 \
+    --retry-all-errors \
+    --connect-timeout 10 \
+    --max-time 120 \
+    "$installer_url" \
+    --output "$installer"
+
+echo "Installing Codex CLI..."
+CODEX_NON_INTERACTIVE=1 /usr/bin/sh "$installer"
+
+if ! command -v codex >/dev/null 2>&1; then
+    echo "Codex installer completed, but codex is not available on PATH." >&2
+    exit 1
+fi
+
+codex --version
 EOF
 chmod 0700 /home/aslate/.local/libexec/install-codex-cli
-chown -R aslate:aslate /home/aslate/.cache /home/aslate/.local
-
-cat << 'EOF' > /etc/systemd/system/codex-user-install.service
-[Unit]
-Description=Install pinned Codex CLI for aslate
-Requires=firstboot-credential-rotation.service
-After=firstboot-credential-rotation.service network-online.target
-Wants=network-online.target
-ConditionPathExists=!/home/aslate/.local/state/codex-0.145.0-installed
-
-[Service]
-Type=oneshot
-User=aslate
-Group=aslate
-Environment=HOME=/home/aslate
-Environment=NPM_CONFIG_CACHE=/home/aslate/.cache/npm
-ExecStart=/home/aslate/.local/libexec/install-codex-cli
-UMask=0077
-NoNewPrivileges=yes
-CapabilityBoundingSet=
-PrivateTmp=yes
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/aslate/.cache/npm /home/aslate/.local
-ProtectControlGroups=yes
-ProtectKernelModules=yes
-ProtectKernelTunables=yes
-RestrictSUIDSGID=yes
-RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-EOF
-
-cat << 'EOF' > /etc/systemd/system/codex-user-install.timer
-[Unit]
-Description=Attempt pinned Codex CLI installation after boot
-
-[Timer]
-OnBootSec=60
-Unit=codex-user-install.service
-
-[Install]
-WantedBy=timers.target
-EOF
-chmod 0644 \
-    /etc/systemd/system/codex-user-install.service \
-    /etc/systemd/system/codex-user-install.timer
-chown root:root \
-    /etc/systemd/system/codex-user-install.service \
-    /etc/systemd/system/codex-user-install.timer
+chown -R aslate:aslate /home/aslate/.local
 
 # Configure UK/GB locale and keyboard layout system-wide
 cat << 'EOF' > /etc/locale.conf
@@ -387,12 +359,15 @@ input * {
 }
 EOF
 
-# Make the user's local npm binaries available to Sway and all descendants.
+# Make the user's local binaries available and install Codex in the background
+# on login so a slow or unavailable network does not block the Sway session.
 install -d -m 0755 /usr/local/libexec
 cat << 'EOF' > /usr/local/libexec/start-sway
 #!/bin/sh
 PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin"
 export PATH
+"$HOME/.local/libexec/install-codex-cli" \
+    >>"$HOME/.local/state/codex-install.log" 2>&1 &
 exec /usr/bin/sway
 EOF
 chmod 0755 /usr/local/libexec/start-sway
@@ -411,7 +386,6 @@ chmod 0644 /etc/greetd/config.toml
 chown root:root /etc/greetd/config.toml
 
 systemctl enable firstboot-credential-rotation.service
-systemctl enable codex-user-install.timer
 systemctl enable greetd.service
 
 # Pre-create Sway configuration directory for user aslate
