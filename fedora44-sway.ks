@@ -113,7 +113,7 @@ wireplumber
 bash-completion
 ca-certificates
 cryptsetup
-git-core
+git
 gparted
 nodejs24-bin
 nodejs24-npm-bin
@@ -154,6 +154,15 @@ set -Eeuo pipefail
 
 # Ensure the standard user owns the home directory before creating user files.
 chown -R aslate:aslate /home/aslate
+
+# Match the installer operator's Git identity for the installed user.
+cat << 'EOF' > /home/aslate/.gitconfig
+[user]
+	email = 4slate@gmail.com
+	name = 4slate
+EOF
+chmod 0600 /home/aslate/.gitconfig
+chown aslate:aslate /home/aslate/.gitconfig
 
 # Require offline rotation of the installation credentials before networking or
 # the graphical login can start on the first installed boot.
