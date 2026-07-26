@@ -50,7 +50,7 @@ firewall --enabled
 selinux --enforcing
 
 rootpw --lock
-user --name=aslate --lock --groups=wheel --shell=/bin/bash
+user --name=changeme --lock --groups=wheel --shell=/bin/bash
 
 # Disk partitioning information
 ignoredisk --only-use=sda
@@ -153,144 +153,179 @@ nano
 %post --erroronfail --log=/root/kickstart-post.log
 set -Eeuo pipefail
 
-# Ensure the standard user owns the home directory before creating user files.
-chown -R aslate:aslate /home/aslate
+# Ensure the temporary standard user owns the home directory before creating user files.
+chown -R changeme:changeme /home/changeme
 
 # Match the installer operator's Git identity for the installed user.
-cat << 'EOF' > /home/aslate/.gitconfig
+cat << 'EOF' > /home/changeme/.gitconfig
 [user]
 	email = 4slate@gmail.com
 	name = 4slate
 EOF
-chmod 0600 /home/aslate/.gitconfig
-chown aslate:aslate /home/aslate/.gitconfig
+chmod 0600 /home/changeme/.gitconfig
+chown changeme:changeme /home/changeme/.gitconfig
 
 # Enable Vim syntax highlighting and filetype-aware plugins and indentation.
-cat << 'EOF' > /home/aslate/.vimrc
+cat << 'EOF' > /home/changeme/.vimrc
 if has('syntax')
     syntax enable
 endif
 filetype plugin indent on
 EOF
-chmod 0644 /home/aslate/.vimrc
-chown aslate:aslate /home/aslate/.vimrc
+chmod 0644 /home/changeme/.vimrc
+chown changeme:changeme /home/changeme/.vimrc
 
-# Require offline rotation of the installation credentials before networking or
-# the graphical login can start on the first installed boot.
-install -d -m 0755 /usr/local/sbin /var/lib/firstboot-setup
+# Require offline rotation of the installation credentials before networking can
+# start on the first installed boot. Greetd remains independent on TTY1.
+install -d -m 0755 /usr/local/sbin
 cat << 'EOF' > /usr/local/sbin/firstboot-credential-rotation
-#!/usr/bin/env bash
-set -Eeuo pipefail
+#!/usr/bin/bash
+set -euo pipefail
 
-completion_marker=/var/lib/firstboot-setup/credentials-rotated
-if [ -e "$completion_marker" ]; then
+readonly marker=/var/lib/firstboot-credential-rotation.complete
+readonly old_user=changeme
+
+if [[ -e "$marker" ]]; then
     exit 0
 fi
 
-trap 'echo "Credential rotation interrupted; networking remains blocked." >&2; exit 1' \
-    HUP INT TERM
+clear
+printf '%s\n' \
+    "Initial security setup" \
+    "Networking will remain disabled until this completes." \
+    ""
 
-if [ ! -t 0 ] || [ ! -t 1 ]; then
-    echo "ERROR: Credential rotation requires an interactive terminal." >&2
+while :; do
+    read -r -p "New username: " new_user
+
+    if [[ "$new_user" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+        break
+    fi
+
+    echo "Enter a valid lowercase Linux username."
+done
+
+if [[ "$new_user" != "$old_user" ]]; then
+    if ! id "$old_user" >/dev/null 2>&1; then
+        echo "Expected initial user '$old_user' does not exist." >&2
+        exit 1
+    fi
+
+    if id "$new_user" >/dev/null 2>&1; then
+        echo "User '$new_user' already exists." >&2
+        exit 1
+    fi
+
+    usermod \
+        --login "$new_user" \
+        --home "/home/$new_user" \
+        --move-home \
+        "$old_user"
+
+    if getent group "$old_user" >/dev/null; then
+        groupmod --new-name "$new_user" "$old_user"
+    fi
+fi
+
+passwd "$new_user"
+
+root_source=$(findmnt -nro SOURCE /)
+root_mapper=$(printf '%s\n' "$root_source" | sed 's/\[.*$//')
+luks_device=$(cryptsetup status "$root_mapper" |
+    awk '$1 == "device:" { print $2; exit }')
+
+if [[ -z "$luks_device" ]] || ! cryptsetup isLuks "$luks_device"; then
+    echo "Unable to resolve the LUKS device backing /." >&2
     exit 1
 fi
 
-# Use the controlling terminal explicitly so PAM and cryptsetup cannot inherit
-# a pipe or the systemd journal as their input.
-exec </dev/tty >/dev/tty 2>&1
-/usr/bin/stty sane
+printf '\nChange the temporary LUKS passphrase for %s.\n' "$luks_device"
+cryptsetup luksChangeKey "$luks_device"
 
-echo "======================================================="
-echo " First boot: secure the installation credentials"
-echo " Networking and graphical login are currently blocked."
-echo "======================================================="
-echo
+install -d -m 0700 /var/lib
+touch "$marker"
+chmod 0600 "$marker"
 
-echo "Set the password for user aslate."
-until /usr/bin/passwd aslate; do
-    echo "Password update failed; please try again."
-    /usr/bin/sleep 1
-done
+sync
 
-root_source=$(/usr/bin/findmnt -nro SOURCE /)
-root_mapper=$(printf '%s\n' "$root_source" | /usr/bin/sed 's/\[.*$//')
-luks_device=$(/usr/bin/cryptsetup status "$root_mapper" |
-    /usr/bin/awk '$1 == "device:" { print $2; exit }')
-
-if [ -z "$luks_device" ] || ! /usr/bin/cryptsetup isLuks "$luks_device"; then
-    echo "ERROR: Unable to resolve the LUKS device backing /." >&2
-    exit 1
-fi
-
-echo
-echo "Change the temporary LUKS passphrase for $luks_device."
-until /usr/bin/cryptsetup luksChangeKey "$luks_device"; do
-    echo "LUKS passphrase update failed; please try again."
-    /usr/bin/sleep 1
-done
-
-/usr/bin/touch "$completion_marker"
-/usr/bin/chmod 0600 "$completion_marker"
-/usr/bin/rm -f /root/anaconda-ks.cfg /root/original-ks.cfg
-
-echo
-echo "Credential rotation completed. Networking and greetd may now start."
+printf '\nCredential rotation completed successfully.\n'
 EOF
 chmod 0700 /usr/local/sbin/firstboot-credential-rotation
 chown root:root /usr/local/sbin/firstboot-credential-rotation
 
+cat << 'EOF' > /usr/local/sbin/cleanup-firstboot-credential-rotation
+#!/usr/bin/bash
+set -euo pipefail
+
+readonly marker=/var/lib/firstboot-credential-rotation.complete
+readonly unit=firstboot-credential-rotation.service
+
+[[ -e "$marker" ]] || {
+    echo "Refusing cleanup: completion marker is absent." >&2
+    exit 1
+}
+
+systemctl disable "$unit"
+
+rm -f \
+    "/etc/systemd/system/$unit" \
+    /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
+
+systemctl daemon-reload
+EOF
+chmod 0700 /usr/local/sbin/cleanup-firstboot-credential-rotation
+chown root:root /usr/local/sbin/cleanup-firstboot-credential-rotation
+
 cat << 'EOF' > /etc/systemd/system/firstboot-credential-rotation.service
 [Unit]
-Description=Rotate installation credentials before networking and login
-ConditionPathExists=!/var/lib/firstboot-setup/credentials-rotated
-Wants=network-pre.target
-After=local-fs.target plymouth-start.service
-Before=network-pre.target network.target greetd.service getty@tty1.service
+Description=Mandatory first-boot credential rotation
+ConditionPathExists=!/var/lib/firstboot-credential-rotation.complete
+
+After=local-fs.target systemd-remount-fs.service
+Wants=local-fs.target
+
+Before=network-pre.target network.target
+Before=NetworkManager.service systemd-networkd.service
+Before=systemd-networkd-wait-online.service NetworkManager-wait-online.service
+
+Conflicts=getty@tty2.service
 
 [Service]
 Type=oneshot
-ExecStartPre=-/usr/bin/plymouth quit
 ExecStart=/usr/local/sbin/firstboot-credential-rotation
-ExecStartPost=/usr/bin/test -e /var/lib/firstboot-setup/credentials-rotated
-# Take tty1 from the boot splash and make it the controlling terminal. passwd
-# and cryptsetup both require a real controlling terminal.
-StandardInput=tty-force
+ExecStartPost=/usr/local/sbin/cleanup-firstboot-credential-rotation
+
+StandardInput=tty
 StandardOutput=tty
 StandardError=tty
-TTYPath=/dev/tty1
+TTYPath=/dev/tty2
 TTYReset=yes
 TTYVHangup=yes
+TTYVTDisallocate=yes
+
+RemainAfterExit=yes
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=network-pre.target
 EOF
 chmod 0644 /etc/systemd/system/firstboot-credential-rotation.service
 chown root:root /etc/systemd/system/firstboot-credential-rotation.service
 
 install -d -m 0755 /etc/systemd/system/NetworkManager.service.d
-cat << 'EOF' > /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+cat << 'EOF' > /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
 [Unit]
 Requires=firstboot-credential-rotation.service
 After=firstboot-credential-rotation.service
 EOF
-chmod 0644 /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
-chown root:root /etc/systemd/system/NetworkManager.service.d/10-firstboot-credentials.conf
+chmod 0644 /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
+chown root:root /etc/systemd/system/NetworkManager.service.d/10-firstboot-gate.conf
 
-install -d -m 0755 /etc/systemd/system/greetd.service.d
-cat << 'EOF' > /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
-[Unit]
-Requires=firstboot-credential-rotation.service
-After=firstboot-credential-rotation.service
-EOF
-chmod 0644 /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
-chown root:root /etc/systemd/system/greetd.service.d/10-firstboot-credentials.conf
-
-# Install Codex for aslate on the first graphical login with network access.
-install -d -o aslate -g aslate -m 0700 \
-    /home/aslate/.local/bin \
-    /home/aslate/.local/libexec \
-    /home/aslate/.local/state
-cat << 'EOF' > /home/aslate/.local/libexec/install-codex-cli
+# Install Codex for the renamed user on the first graphical login with network access.
+install -d -o changeme -g changeme -m 0700 \
+    /home/changeme/.local/bin \
+    /home/changeme/.local/libexec \
+    /home/changeme/.local/state
+cat << 'EOF' > /home/changeme/.local/libexec/install-codex-cli
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -337,8 +372,8 @@ fi
 
 codex --version
 EOF
-chmod 0700 /home/aslate/.local/libexec/install-codex-cli
-chown -R aslate:aslate /home/aslate/.local
+chmod 0700 /home/changeme/.local/libexec/install-codex-cli
+chown -R changeme:changeme /home/changeme/.local
 
 # Configure UK/GB locale and keyboard layout system-wide
 cat << 'EOF' > /etc/locale.conf
@@ -378,6 +413,9 @@ systemctl set-default graphical.target
 
 install -d -m 0755 /etc/greetd
 cat << 'EOF' > /etc/greetd/config.toml
+[terminal]
+vt = 1
+
 [default_session]
 command = "tuigreet --time --cmd /usr/local/libexec/start-sway"
 user = "greeter"
@@ -388,12 +426,12 @@ chown root:root /etc/greetd/config.toml
 systemctl enable firstboot-credential-rotation.service
 systemctl enable greetd.service
 
-# Pre-create Sway configuration directory for user aslate
-mkdir -p /home/aslate/.config/sway
+# Pre-create Sway configuration directory for the temporary user.
+mkdir -p /home/changeme/.config/sway
 if [ -f /etc/sway/config ]; then
-    cp /etc/sway/config /home/aslate/.config/sway/config
+    cp /etc/sway/config /home/changeme/.config/sway/config
 fi
-chown -R aslate:aslate /home/aslate/.config
+chown -R changeme:changeme /home/changeme/.config
 
 # Mask and disable Brltty & AT-SPI Accessibility services globally
 systemctl mask brltty.service brltty-udev.service 2>/dev/null || true
