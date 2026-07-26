@@ -164,6 +164,16 @@ EOF
 chmod 0600 /home/aslate/.gitconfig
 chown aslate:aslate /home/aslate/.gitconfig
 
+# Enable Vim syntax highlighting and filetype-aware plugins and indentation.
+cat << 'EOF' > /home/aslate/.vimrc
+if has('syntax')
+    syntax enable
+endif
+filetype plugin indent on
+EOF
+chmod 0644 /home/aslate/.vimrc
+chown aslate:aslate /home/aslate/.vimrc
+
 # Require offline rotation of the installation credentials before networking or
 # the graphical login can start on the first installed boot.
 install -d -m 0755 /usr/local/sbin /var/lib/firstboot-setup
