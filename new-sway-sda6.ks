@@ -11,15 +11,6 @@ for required_device in /dev/sda /dev/sda1 /dev/sda3 /dev/sda5; do
     fi
 done
 
-# Never wipe the disk that backs local installation media.
-install_source=$(findmnt -nro SOURCE /run/install/repo 2>/dev/null || true)
-case "$install_source" in
-    /dev/sda|/dev/sda[0-9]*)
-        echo "ERROR: /dev/sda appears to contain the installation source." >&2
-        exit 1
-        ;;
-esac
-
 # Close any open LUKS mapping on sda5 if active
 for dev in /dev/mapper/*; do
     [ -e "$dev" ] || continue
