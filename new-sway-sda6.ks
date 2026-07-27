@@ -4,23 +4,23 @@
 set -Eeuo pipefail
 
 # Fail closed unless the expected target disk and preserved partitions exist.
-for required_device in /dev/sda /dev/sda1 /dev/sda3 /dev/sda5; do
+for required_device in /dev/sda /dev/sda1 /dev/sda3 /dev/sda6; do
     if [ ! -b "$required_device" ]; then
         echo "ERROR: Required target device $required_device does not exist." >&2
         exit 1
     fi
 done
 
-# Close any open LUKS mapping on sda5 if active
+# Close any open LUKS mapping on sda6 if active
 for dev in /dev/mapper/*; do
     [ -e "$dev" ] || continue
-    if cryptsetup status "$dev" 2>/dev/null | grep -q "/dev/sda5"; then
+    if cryptsetup status "$dev" 2>/dev/null | grep -q "/dev/sda6"; then
         cryptsetup close "$dev"
     fi
 done
 
 # Wipe pre-existing filesystem, LVM, or LUKS signatures on the validated target.
-wipefs -a -f /dev/sda5
+wipefs -a -f /dev/sda6
 udevadm settle
 %end
 
@@ -53,8 +53,8 @@ part /boot/efi --fstype="efi" --onpart=/dev/sda1 --noformat
 # /boot partition on sda3
 part /boot --fstype="ext4" --onpart=/dev/sda3
 
-# Encrypted partition on sda5 (re-formatted and re-encrypted)
-part btrfs.01 --fstype="btrfs" --encrypted --luks-version=luks2 --pbkdf=argon2id --cipher=aes-xts-plain64 --passphrase=changeme_luks --onpart=/dev/sda5
+# Encrypted partition on sda6 (re-formatted and re-encrypted)
+part btrfs.01 --fstype="btrfs" --encrypted --luks-version=luks2 --pbkdf=argon2id --cipher=aes-xts-plain64 --passphrase=changeme_luks --onpart=/dev/sda6
 
 # Main Btrfs volume container
 btrfs none --label=fedora btrfs.01
